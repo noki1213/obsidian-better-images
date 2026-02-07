@@ -1,4 +1,4 @@
-import { Plugin, PluginSettingTab, App, Setting, MarkdownPostProcessorContext, MarkdownView } from "obsidian";
+import { Plugin, PluginSettingTab, App, Setting, MarkdownPostProcessorContext, MarkdownView, TFile, Notice } from "obsidian";
 
 // プラグインの設定の型定義
 interface AdvancedImageSettings {
@@ -19,6 +19,12 @@ const DEFAULT_SETTINGS: AdvancedImageSettings = {
 
 // パーセント指定のパターン（例: "50%" や "image 50%"）
 const PERCENT_PATTERN = /(\d{1,3})%$/;
+
+// 画像の拡張子一覧
+const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "bmp", "svg", "webp", "avif", "heic", "tif", "tiff"];
+
+// 画像リンクのパターン: ![[ファイル名.拡張子]] または ![[ファイル名.拡張子|...]]
+const IMAGE_LINK_PATTERN = /!\[\[([^\]|]+\.(png|jpg|jpeg|gif|bmp|svg|webp|avif|heic|tif|tiff))(\|[^\]]*)?\]\]/gi;
 
 export default class AdvancedImagePlugin extends Plugin {
 	settings: AdvancedImageSettings = DEFAULT_SETTINGS;
@@ -68,7 +74,7 @@ export default class AdvancedImagePlugin extends Plugin {
 			this.debouncedScanAll();
 		});
 
-		// 画像をペースト/ドロップしたとき、自動でデフォルトの%値を付ける
+		// 画像をペースト/ドロップしたとき、自動でリネーム＋デフォルトの%値を付ける
 		this.registerEvent(
 			this.app.workspace.on("editor-paste", (evt: ClipboardEvent, editor, view) => {
 				this.handleImageInsert(editor);
@@ -80,6 +86,12 @@ export default class AdvancedImagePlugin extends Plugin {
 				this.handleImageInsert(editor);
 			})
 		);
+
+		// コピー（Cmd+C）したとき、カーソル行が画像リンクなら
+		// テキストと画像データの両方をクリップボードに入れる
+		this.registerDomEvent(document, "copy", (evt: ClipboardEvent) => {
+			this.handleImageCopy(evt);
+		});
 
 		// 設定画面を追加
 		this.addSettingTab(new AdvancedImageSettingTab(this.app, this));
@@ -261,32 +273,168 @@ export default class AdvancedImagePlugin extends Plugin {
 		this.debouncedScanAll();
 	}
 
-	// 画像がペースト/ドロップされたとき、デフォルトの%値を自動で追加する
+	// 現在の日時を YYYY-MM-DD_HH-mm-ss 形式で返す
+	getFormattedDate(): string {
+		const now = new Date();
+		const pad = (n: number) => String(n).padStart(2, "0");
+		return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+	}
+
+	// 同名ファイルがある場合、数字サフィックスを付けたパスを返す
+	async getUniqueFilePath(folderPath: string, baseName: string, ext: string): Promise<string> {
+		let candidate = `${folderPath}/${baseName}.${ext}`;
+		if (!this.app.vault.getAbstractFileByPath(candidate)) {
+			return candidate;
+		}
+		// 同名ファイルがあれば _1, _2, ... と試す
+		let suffix = 1;
+		while (true) {
+			candidate = `${folderPath}/${baseName}_${suffix}.${ext}`;
+			if (!this.app.vault.getAbstractFileByPath(candidate)) {
+				return candidate;
+			}
+			suffix++;
+		}
+	}
+
+	// 画像がペースト/ドロップされたとき、リネーム＋デフォルトの%値を自動で追加する
 	handleImageInsert(editor: any) {
 		const defaultPercent = this.settings.defaultPercent;
 
 		// 少し待ってからObsidianが画像リンクを書き込むのを待つ
-		setTimeout(() => {
+		setTimeout(async () => {
 			const cursor = editor.getCursor();
 			const line = editor.getLine(cursor.line);
 
-			// 画像リンクのパターンを探す: ![[ファイル名]] （%がまだ付いていないもの）
-			// 画像の拡張子で判定する
-			const imagePattern = /!\[\[([^\]]+\.(png|jpg|jpeg|gif|bmp|svg|webp|avif|heic|tif|tiff))\]\]/gi;
-			let newLine = line;
-			let modified = false;
+			// 画像リンクのパターンを探す: ![[ファイル名.拡張子]]（パイプ無し＝まだ加工されていないもの）
+			const pastedPattern = /!\[\[([^\]|]+\.(png|jpg|jpeg|gif|bmp|svg|webp|avif|heic|tif|tiff))\]\]/gi;
+			const match = pastedPattern.exec(line);
+			if (!match) return;
 
-			newLine = line.replace(imagePattern, (match: string, filename: string, ext: string) => {
-				// 既にパーセント指定やサイズ指定がある場合はスキップする
-				if (filename.includes("|")) return match;
-				modified = true;
-				return `![[${filename}|${defaultPercent}%]]`;
-			});
+			const originalFilename = match[1];
+			// 既にパイプ付きなら何もしない
+			if (originalFilename.includes("|")) return;
 
-			if (modified) {
+			// 元の画像ファイルを見つける
+			const originalFile = this.app.vault.getAbstractFileByPath(originalFilename)
+				|| this.app.metadataCache.getFirstLinkpathDest(originalFilename, "");
+
+			if (!originalFile || !(originalFile instanceof TFile)) {
+				// ファイルが見つからない場合は%だけ追加する
+				const newLine = line.replace(match[0], `![[${originalFilename}|${defaultPercent}%]]`);
+				editor.setLine(cursor.line, newLine);
+				return;
+			}
+
+			// 現在のノート名を取得
+			const activeFile = this.app.workspace.getActiveFile();
+			const noteName = activeFile ? activeFile.basename : "untitled";
+
+			// 新しいファイル名を作る: ノート名_日時.拡張子
+			const dateStr = this.getFormattedDate();
+			const ext = originalFile.extension;
+			const newBaseName = `${noteName}_${dateStr}`;
+
+			// 画像ファイルがあるフォルダのパス
+			const folderPath = originalFile.parent ? originalFile.parent.path : "";
+
+			// 同名ファイルがないか確認し、あれば数字サフィックスを付ける
+			const newPath = await this.getUniqueFilePath(folderPath, newBaseName, ext);
+			const newFileName = newPath.split("/").pop() || `${newBaseName}.${ext}`;
+
+			// ファイルをリネームする
+			try {
+				await this.app.fileManager.renameFile(originalFile, newPath);
+
+				// エディタのリンクを新しいファイル名＋%に更新する
+				// renameFile がリンクを自動更新するので、再度行を読み直す
+				const updatedLine = editor.getLine(cursor.line);
+				const nameWithoutExt = newFileName.replace(`.${ext}`, "");
+				// リネーム後のリンクにパーセントを追加する
+				const renamePattern = new RegExp(
+					`!\\[\\[${nameWithoutExt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.${ext}\\]\\]`,
+					"g"
+				);
+				if (renamePattern.test(updatedLine)) {
+					const finalLine = updatedLine.replace(renamePattern, `![[${newFileName}|${defaultPercent}%]]`);
+					editor.setLine(cursor.line, finalLine);
+				}
+			} catch (e) {
+				// リネーム失敗時は元のファイル名に%だけ追加する
+				const currentLine = editor.getLine(cursor.line);
+				const fallbackPattern = new RegExp(
+					`!\\[\\[${originalFilename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]\\]`,
+					"g"
+				);
+				const newLine = currentLine.replace(fallbackPattern, `![[${originalFilename}|${defaultPercent}%]]`);
 				editor.setLine(cursor.line, newLine);
 			}
-		}, 500);
+		}, 800);
+	}
+
+	// コピー時に、カーソル行が画像リンクなら
+	// 最初にテキストをコピー → 少し後に画像データでクリップボードを上書きする
+	async handleImageCopy(evt: ClipboardEvent) {
+		// アクティブなエディタを取得
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view) return;
+		const editor = view.editor;
+
+		// 選択範囲があるかチェック
+		const selection = editor.getSelection();
+		// カーソルがある行のテキストを取得
+		const cursor = editor.getCursor();
+		const line = editor.getLine(cursor.line);
+
+		// 選択範囲 または 行全体から画像リンクを探す
+		const textToCheck = selection || line;
+		IMAGE_LINK_PATTERN.lastIndex = 0;
+		const match = IMAGE_LINK_PATTERN.exec(textToCheck);
+		if (!match) return;
+
+		// 画像リンクが見つかった
+		const imageFilename = match[1];
+
+		// 画像ファイルを探す
+		const imageFile = this.app.metadataCache.getFirstLinkpathDest(imageFilename, "");
+		if (!imageFile || !(imageFile instanceof TFile)) return;
+
+		// デフォルトのコピーを止めて、自分で処理する
+		evt.preventDefault();
+
+		// コピーするテキスト（選択範囲があればそれ、なければ行全体）
+		const textToCopy = selection || line;
+
+		// ① まずテキストをクリップボードにコピーする
+		await navigator.clipboard.writeText(textToCopy);
+		new Notice("テキストをコピーしました");
+
+		// ② 1.5秒後に画像データでクリップボードを上書きする
+		setTimeout(async () => {
+			try {
+				// 画像ファイルのバイナリデータを読み込む
+				const imageData = await this.app.vault.readBinary(imageFile);
+
+				// 画像の MIME タイプを判定する（例: image/png, image/jpeg）
+				const ext = imageFile.extension.toLowerCase();
+				let mimeType = "image/png";
+				if (ext === "jpg" || ext === "jpeg") mimeType = "image/jpeg";
+				else if (ext === "gif") mimeType = "image/gif";
+				else if (ext === "webp") mimeType = "image/webp";
+				else if (ext === "bmp") mimeType = "image/bmp";
+				else if (ext === "svg") mimeType = "image/svg+xml";
+				else if (ext === "avif") mimeType = "image/avif";
+
+				// クリップボードを画像データで上書きする
+				const clipboardItem = new ClipboardItem({
+					[mimeType]: new Blob([imageData], { type: mimeType }),
+				});
+				await navigator.clipboard.write([clipboardItem]);
+				new Notice("画像をコピーしました");
+			} catch (e) {
+				new Notice("画像のコピーに失敗しました");
+			}
+		}, 1500);
 	}
 }
 
