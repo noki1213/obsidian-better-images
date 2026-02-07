@@ -1,0 +1,11 @@
+/* Advanced Image プラグイン - パーセント表示のスタイル */
+
+/* パーセント指定された画像の基本スタイル */
+img.advanced-image-percent {
+	/* 縦横比を自動で維持する */
+	height: auto !important;
+	/* 画像の表示をブロック要素にして、幅の指定が正しく効くようにする */
+	display: block;
+	/* 滑らかに表示する */
+	object-fit: contain;
+}

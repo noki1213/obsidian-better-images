@@ -1,0 +1,9 @@
+{
+	"id": "advanced-image",
+	"name": "Advanced Image",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "画像の大きさをパーセント（%）で指定できるプラグイン。モバイルでは自動で100%表示に対応。",
+	"author": "maaya",
+	"isDesktopOnly": false
+}
