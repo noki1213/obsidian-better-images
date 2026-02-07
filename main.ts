@@ -74,16 +74,28 @@ export default class AdvancedImagePlugin extends Plugin {
 			this.debouncedScanAll();
 		});
 
-		// When an image is pasted/dropped, automatically rename it and add the default % value
+		// When an image is pasted, stop Obsidian's default handling and
+		// Save it ourselves under the correct filename (same approach as image-converter)
 		this.registerEvent(
-			this.app.workspace.on("editor-paste", (evt: ClipboardEvent, editor, view) => {
-				this.handleImageInsert(editor);
+			this.app.workspace.on("editor-paste", (evt: ClipboardEvent, editor) => {
+				if (!evt.clipboardData) return;
+				// Check whether the clipboard has an image file
+				const imageFile = this.getImageFileFromDataTransfer(evt.clipboardData);
+				if (!imageFile) return;
+				// Stop Obsidian's default paste handling
+				evt.preventDefault();
+				this.saveImageAndInsertLink(imageFile, editor);
 			})
 		);
 
+		// When an image is dropped
 		this.registerEvent(
-			this.app.workspace.on("editor-drop", (evt: DragEvent, editor, view) => {
-				this.handleImageInsert(editor);
+			this.app.workspace.on("editor-drop", (evt: DragEvent, editor) => {
+				if (!evt.dataTransfer) return;
+				const imageFile = this.getImageFileFromDataTransfer(evt.dataTransfer);
+				if (!imageFile) return;
+				evt.preventDefault();
+				this.saveImageAndInsertLink(imageFile, editor);
 			})
 		);
 
@@ -280,16 +292,27 @@ export default class AdvancedImagePlugin extends Plugin {
 		return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
 	}
 
+	// Pull image files out of a DataTransfer (clipboard or drag data)
+	getImageFileFromDataTransfer(dataTransfer: DataTransfer): File | null {
+		for (let i = 0; i < dataTransfer.items.length; i++) {
+			const item = dataTransfer.items[i];
+			if (item.kind === "file" && item.type.startsWith("image/")) {
+				return item.getAsFile();
+			}
+		}
+		return null;
+	}
+
 	// If a file with the same name exists, return a path with a numeric suffix
 	async getUniqueFilePath(folderPath: string, baseName: string, ext: string): Promise<string> {
-		let candidate = `${folderPath}/${baseName}.${ext}`;
+		const prefix = folderPath ? `${folderPath}/` : "";
+		let candidate = `${prefix}${baseName}.${ext}`;
 		if (!this.app.vault.getAbstractFileByPath(candidate)) {
 			return candidate;
 		}
-		// If a file with the same name exists, try _1, _2, and so on
 		let suffix = 1;
 		while (true) {
-			candidate = `${folderPath}/${baseName}_${suffix}.${ext}`;
+			candidate = `${prefix}${baseName}_${suffix}.${ext}`;
 			if (!this.app.vault.getAbstractFileByPath(candidate)) {
 				return candidate;
 			}
@@ -297,79 +320,41 @@ export default class AdvancedImagePlugin extends Plugin {
 		}
 	}
 
-	// When an image is pasted/dropped, automatically rename it and append the default % value
-	handleImageInsert(editor: any) {
+	// Save the image file into the vault and insert the link into the editor
+	async saveImageAndInsertLink(imageFile: File, editor: any) {
 		const defaultPercent = this.settings.defaultPercent;
 
-		// Wait a bit for Obsidian to finish writing the image link
-		setTimeout(async () => {
-			const cursor = editor.getCursor();
-			const line = editor.getLine(cursor.line);
-
-			// Look for the image-link pattern: ![[filename.ext]] (no pipe = not processed yet)
-			const pastedPattern = /!\[\[([^\]|]+\.(png|jpg|jpeg|gif|bmp|svg|webp|avif|heic|tif|tiff))\]\]/gi;
-			const match = pastedPattern.exec(line);
-			if (!match) return;
-
-			const originalFilename = match[1];
-			// Do nothing if it already has a pipe
-			if (originalFilename.includes("|")) return;
-
-			// Find the original image file
-			const originalFile = this.app.vault.getAbstractFileByPath(originalFilename)
-				|| this.app.metadataCache.getFirstLinkpathDest(originalFilename, "");
-
-			if (!originalFile || !(originalFile instanceof TFile)) {
-				// If the file isn't found, just append the %
-				const newLine = line.replace(match[0], `![[${originalFilename}|${defaultPercent}%]]`);
-				editor.setLine(cursor.line, newLine);
-				return;
-			}
-
-			// Get the current note's name
+		try {
+			// Get info about the current note
 			const activeFile = this.app.workspace.getActiveFile();
 			const noteName = activeFile ? activeFile.basename : "untitled";
 
-			// Build the new file name: notename_timestamp.ext
+			// Build the filename: note-name_timestamp.extension
 			const dateStr = this.getFormattedDate();
-			const ext = originalFile.extension;
+			// Get the original extension (image/png → png)
+			const ext = imageFile.name.split(".").pop() || "png";
 			const newBaseName = `${noteName}_${dateStr}`;
 
-			// Path to the folder containing the image file
-			const folderPath = originalFile.parent ? originalFile.parent.path : "";
+			// Get the destination folder (uses Obsidian's attachment settings)
+			// @ts-ignore - getAvailablePathForAttachments is an internal API but stable enough to rely on
+			const savePath = await this.app.vault.getAvailablePathForAttachments(newBaseName, ext, activeFile);
 
-			// Check whether a file with the same name exists, and append a numeric suffix if so
-			const newPath = await this.getUniqueFilePath(folderPath, newBaseName, ext);
-			const newFileName = newPath.split("/").pop() || `${newBaseName}.${ext}`;
+			// Load the image data
+			const arrayBuffer = await imageFile.arrayBuffer();
 
-			// Rename the file
-			try {
-				await this.app.fileManager.renameFile(originalFile, newPath);
+			// Save the file into the vault
+			const savedFile = await this.app.vault.createBinary(savePath, arrayBuffer);
 
-				// Update the editor's link to the new file name + %
-				// renameFile auto-updates the link, so re-read the line
-				const updatedLine = editor.getLine(cursor.line);
-				const nameWithoutExt = newFileName.replace(`.${ext}`, "");
-				// Append the percentage to the link after renaming
-				const renamePattern = new RegExp(
-					`!\\[\\[${nameWithoutExt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.${ext}\\]\\]`,
-					"g"
-				);
-				if (renamePattern.test(updatedLine)) {
-					const finalLine = updatedLine.replace(renamePattern, `![[${newFileName}|${defaultPercent}%]]`);
-					editor.setLine(cursor.line, finalLine);
-				}
-			} catch (e) {
-				// If the rename fails, just append % to the original file name
-				const currentLine = editor.getLine(cursor.line);
-				const fallbackPattern = new RegExp(
-					`!\\[\\[${originalFilename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]\\]`,
-					"g"
-				);
-				const newLine = currentLine.replace(fallbackPattern, `![[${originalFilename}|${defaultPercent}%]]`);
-				editor.setLine(cursor.line, newLine);
-			}
-		}, 800);
+			// Extract just the filename (the folder path isn't needed)
+			const savedFileName = savedFile.name;
+
+			// Insert the link into the editor
+			const linkText = `![[${savedFileName}|${defaultPercent}%]]`;
+			editor.replaceSelection(linkText);
+
+		} catch (e) {
+			new Notice("画像の保存に失敗しました");
+		}
 	}
 
 	// On copy, if the cursor line is an image link
