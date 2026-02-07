@@ -1,4 +1,4 @@
-import { Plugin, PluginSettingTab, App, Setting, MarkdownPostProcessorContext, MarkdownView } from "obsidian";
+import { Plugin, PluginSettingTab, App, Setting, MarkdownPostProcessorContext, MarkdownView, TFile, Notice } from "obsidian";
 
 // Type definition for the plugin's settings
 interface AdvancedImageSettings {
@@ -19,6 +19,12 @@ const DEFAULT_SETTINGS: AdvancedImageSettings = {
 
 // Pattern for a percent spec (e.g. "50%" or "image 50%")
 const PERCENT_PATTERN = /(\d{1,3})%$/;
+
+// List of image extensions
+const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "bmp", "svg", "webp", "avif", "heic", "tif", "tiff"];
+
+// Image link pattern: ![[filename.ext]] or ![[filename.ext|...]]
+const IMAGE_LINK_PATTERN = /!\[\[([^\]|]+\.(png|jpg|jpeg|gif|bmp|svg|webp|avif|heic|tif|tiff))(\|[^\]]*)?\]\]/gi;
 
 export default class AdvancedImagePlugin extends Plugin {
 	settings: AdvancedImageSettings = DEFAULT_SETTINGS;
@@ -68,7 +74,7 @@ export default class AdvancedImagePlugin extends Plugin {
 			this.debouncedScanAll();
 		});
 
-		// When an image is pasted/dropped, automatically add the default % value
+		// When an image is pasted/dropped, automatically rename it and add the default % value
 		this.registerEvent(
 			this.app.workspace.on("editor-paste", (evt: ClipboardEvent, editor, view) => {
 				this.handleImageInsert(editor);
@@ -80,6 +86,12 @@ export default class AdvancedImagePlugin extends Plugin {
 				this.handleImageInsert(editor);
 			})
 		);
+
+		// When copying (Cmd+C), if the cursor line is an image link
+		// Put both text and image data on the clipboard
+		this.registerDomEvent(document, "copy", (evt: ClipboardEvent) => {
+			this.handleImageCopy(evt);
+		});
 
 		// Add the settings tab
 		this.addSettingTab(new AdvancedImageSettingTab(this.app, this));
@@ -261,32 +273,168 @@ export default class AdvancedImagePlugin extends Plugin {
 		this.debouncedScanAll();
 	}
 
-	// When an image is pasted/dropped, automatically append the default % value
+	// Return the current date/time as YYYY-MM-DD_HH-mm-ss
+	getFormattedDate(): string {
+		const now = new Date();
+		const pad = (n: number) => String(n).padStart(2, "0");
+		return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+	}
+
+	// If a file with the same name exists, return a path with a numeric suffix
+	async getUniqueFilePath(folderPath: string, baseName: string, ext: string): Promise<string> {
+		let candidate = `${folderPath}/${baseName}.${ext}`;
+		if (!this.app.vault.getAbstractFileByPath(candidate)) {
+			return candidate;
+		}
+		// If a file with the same name exists, try _1, _2, and so on
+		let suffix = 1;
+		while (true) {
+			candidate = `${folderPath}/${baseName}_${suffix}.${ext}`;
+			if (!this.app.vault.getAbstractFileByPath(candidate)) {
+				return candidate;
+			}
+			suffix++;
+		}
+	}
+
+	// When an image is pasted/dropped, automatically rename it and append the default % value
 	handleImageInsert(editor: any) {
 		const defaultPercent = this.settings.defaultPercent;
 
 		// Wait a bit for Obsidian to finish writing the image link
-		setTimeout(() => {
+		setTimeout(async () => {
 			const cursor = editor.getCursor();
 			const line = editor.getLine(cursor.line);
 
-			// Look for the image-link pattern: ![[filename]] (one that doesn't have a % yet)
-			// Determine it from the image's file extension
-			const imagePattern = /!\[\[([^\]]+\.(png|jpg|jpeg|gif|bmp|svg|webp|avif|heic|tif|tiff))\]\]/gi;
-			let newLine = line;
-			let modified = false;
+			// Look for the image-link pattern: ![[filename.ext]] (no pipe = not processed yet)
+			const pastedPattern = /!\[\[([^\]|]+\.(png|jpg|jpeg|gif|bmp|svg|webp|avif|heic|tif|tiff))\]\]/gi;
+			const match = pastedPattern.exec(line);
+			if (!match) return;
 
-			newLine = line.replace(imagePattern, (match: string, filename: string, ext: string) => {
-				// Skip if a percentage or size is already specified
-				if (filename.includes("|")) return match;
-				modified = true;
-				return `![[${filename}|${defaultPercent}%]]`;
-			});
+			const originalFilename = match[1];
+			// Do nothing if it already has a pipe
+			if (originalFilename.includes("|")) return;
 
-			if (modified) {
+			// Find the original image file
+			const originalFile = this.app.vault.getAbstractFileByPath(originalFilename)
+				|| this.app.metadataCache.getFirstLinkpathDest(originalFilename, "");
+
+			if (!originalFile || !(originalFile instanceof TFile)) {
+				// If the file isn't found, just append the %
+				const newLine = line.replace(match[0], `![[${originalFilename}|${defaultPercent}%]]`);
+				editor.setLine(cursor.line, newLine);
+				return;
+			}
+
+			// Get the current note's name
+			const activeFile = this.app.workspace.getActiveFile();
+			const noteName = activeFile ? activeFile.basename : "untitled";
+
+			// Build the new file name: notename_timestamp.ext
+			const dateStr = this.getFormattedDate();
+			const ext = originalFile.extension;
+			const newBaseName = `${noteName}_${dateStr}`;
+
+			// Path to the folder containing the image file
+			const folderPath = originalFile.parent ? originalFile.parent.path : "";
+
+			// Check whether a file with the same name exists, and append a numeric suffix if so
+			const newPath = await this.getUniqueFilePath(folderPath, newBaseName, ext);
+			const newFileName = newPath.split("/").pop() || `${newBaseName}.${ext}`;
+
+			// Rename the file
+			try {
+				await this.app.fileManager.renameFile(originalFile, newPath);
+
+				// Update the editor's link to the new file name + %
+				// renameFile auto-updates the link, so re-read the line
+				const updatedLine = editor.getLine(cursor.line);
+				const nameWithoutExt = newFileName.replace(`.${ext}`, "");
+				// Append the percentage to the link after renaming
+				const renamePattern = new RegExp(
+					`!\\[\\[${nameWithoutExt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.${ext}\\]\\]`,
+					"g"
+				);
+				if (renamePattern.test(updatedLine)) {
+					const finalLine = updatedLine.replace(renamePattern, `![[${newFileName}|${defaultPercent}%]]`);
+					editor.setLine(cursor.line, finalLine);
+				}
+			} catch (e) {
+				// If the rename fails, just append % to the original file name
+				const currentLine = editor.getLine(cursor.line);
+				const fallbackPattern = new RegExp(
+					`!\\[\\[${originalFilename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]\\]`,
+					"g"
+				);
+				const newLine = currentLine.replace(fallbackPattern, `![[${originalFilename}|${defaultPercent}%]]`);
 				editor.setLine(cursor.line, newLine);
 			}
-		}, 500);
+		}, 800);
+	}
+
+	// On copy, if the cursor line is an image link
+	// Copy the text first, then overwrite the clipboard with image data shortly after
+	async handleImageCopy(evt: ClipboardEvent) {
+		// Get the active editor
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view) return;
+		const editor = view.editor;
+
+		// Check whether there's a selection
+		const selection = editor.getSelection();
+		// Get the text of the line the cursor is on
+		const cursor = editor.getCursor();
+		const line = editor.getLine(cursor.line);
+
+		// Look for an image link in the selection, or the whole line
+		const textToCheck = selection || line;
+		IMAGE_LINK_PATTERN.lastIndex = 0;
+		const match = IMAGE_LINK_PATTERN.exec(textToCheck);
+		if (!match) return;
+
+		// Found an image link
+		const imageFilename = match[1];
+
+		// Look for image files
+		const imageFile = this.app.metadataCache.getFirstLinkpathDest(imageFilename, "");
+		if (!imageFile || !(imageFile instanceof TFile)) return;
+
+		// Stop the default copy and handle it ourselves
+		evt.preventDefault();
+
+		// The text to copy (the selection if there is one, otherwise the whole line)
+		const textToCopy = selection || line;
+
+		// (1) First, copy the text to the clipboard
+		await navigator.clipboard.writeText(textToCopy);
+		new Notice("テキストをコピーしました");
+
+		// (2) Overwrite the clipboard with image data 1.5 seconds later
+		setTimeout(async () => {
+			try {
+				// Read the image file's binary data
+				const imageData = await this.app.vault.readBinary(imageFile);
+
+				// Determine the image's MIME type (e.g. image/png, image/jpeg)
+				const ext = imageFile.extension.toLowerCase();
+				let mimeType = "image/png";
+				if (ext === "jpg" || ext === "jpeg") mimeType = "image/jpeg";
+				else if (ext === "gif") mimeType = "image/gif";
+				else if (ext === "webp") mimeType = "image/webp";
+				else if (ext === "bmp") mimeType = "image/bmp";
+				else if (ext === "svg") mimeType = "image/svg+xml";
+				else if (ext === "avif") mimeType = "image/avif";
+
+				// Overwrite the clipboard with image data
+				const clipboardItem = new ClipboardItem({
+					[mimeType]: new Blob([imageData], { type: mimeType }),
+				});
+				await navigator.clipboard.write([clipboardItem]);
+				new Notice("画像をコピーしました");
+			} catch (e) {
+				new Notice("画像のコピーに失敗しました");
+			}
+		}, 1500);
 	}
 }
 
