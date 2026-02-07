@@ -1,0 +1,9 @@
+{
+	"id": "advanced-image",
+	"name": "Advanced Image",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "A plugin that lets you specify image size as a percentage (%).モバイルでは自動で100%表示に対応。",
+	"author": "noki",
+	"isDesktopOnly": false
+}

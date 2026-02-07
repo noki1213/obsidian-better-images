@@ -1,0 +1,11 @@
+/* Advanced Image plugin - styling for percentage display */
+
+/* Base style for images with a percentage specified */
+img.advanced-image-percent {
+	/* Automatically preserve the aspect ratio */
+	height: auto !important;
+	/* Make the image display as a block element so the width setting applies correctly */
+	display: block;
+	/* Render it smoothly */
+	object-fit: contain;
+}
