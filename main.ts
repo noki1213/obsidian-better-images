@@ -74,16 +74,28 @@ export default class AdvancedImagePlugin extends Plugin {
 			this.debouncedScanAll();
 		});
 
-		// 画像をペースト/ドロップしたとき、自動でリネーム＋デフォルトの%値を付ける
+		// 画像をペーストしたとき、Obsidianのデフォルト処理を止めて
+		// 自分で正しいファイル名で保存する（image-converter と同じ方式）
 		this.registerEvent(
-			this.app.workspace.on("editor-paste", (evt: ClipboardEvent, editor, view) => {
-				this.handleImageInsert(editor);
+			this.app.workspace.on("editor-paste", (evt: ClipboardEvent, editor) => {
+				if (!evt.clipboardData) return;
+				// クリップボードに画像ファイルがあるか確認する
+				const imageFile = this.getImageFileFromDataTransfer(evt.clipboardData);
+				if (!imageFile) return;
+				// Obsidianのデフォルトのペースト処理を止める
+				evt.preventDefault();
+				this.saveImageAndInsertLink(imageFile, editor);
 			})
 		);
 
+		// 画像をドロップしたとき
 		this.registerEvent(
-			this.app.workspace.on("editor-drop", (evt: DragEvent, editor, view) => {
-				this.handleImageInsert(editor);
+			this.app.workspace.on("editor-drop", (evt: DragEvent, editor) => {
+				if (!evt.dataTransfer) return;
+				const imageFile = this.getImageFileFromDataTransfer(evt.dataTransfer);
+				if (!imageFile) return;
+				evt.preventDefault();
+				this.saveImageAndInsertLink(imageFile, editor);
 			})
 		);
 
@@ -280,16 +292,27 @@ export default class AdvancedImagePlugin extends Plugin {
 		return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
 	}
 
+	// DataTransfer（クリップボードやドラッグデータ）から画像ファイルを取り出す
+	getImageFileFromDataTransfer(dataTransfer: DataTransfer): File | null {
+		for (let i = 0; i < dataTransfer.items.length; i++) {
+			const item = dataTransfer.items[i];
+			if (item.kind === "file" && item.type.startsWith("image/")) {
+				return item.getAsFile();
+			}
+		}
+		return null;
+	}
+
 	// 同名ファイルがある場合、数字サフィックスを付けたパスを返す
 	async getUniqueFilePath(folderPath: string, baseName: string, ext: string): Promise<string> {
-		let candidate = `${folderPath}/${baseName}.${ext}`;
+		const prefix = folderPath ? `${folderPath}/` : "";
+		let candidate = `${prefix}${baseName}.${ext}`;
 		if (!this.app.vault.getAbstractFileByPath(candidate)) {
 			return candidate;
 		}
-		// 同名ファイルがあれば _1, _2, ... と試す
 		let suffix = 1;
 		while (true) {
-			candidate = `${folderPath}/${baseName}_${suffix}.${ext}`;
+			candidate = `${prefix}${baseName}_${suffix}.${ext}`;
 			if (!this.app.vault.getAbstractFileByPath(candidate)) {
 				return candidate;
 			}
@@ -297,79 +320,41 @@ export default class AdvancedImagePlugin extends Plugin {
 		}
 	}
 
-	// 画像がペースト/ドロップされたとき、リネーム＋デフォルトの%値を自動で追加する
-	handleImageInsert(editor: any) {
+	// 画像ファイルをVaultに保存して、リンクをエディタに挿入する
+	async saveImageAndInsertLink(imageFile: File, editor: any) {
 		const defaultPercent = this.settings.defaultPercent;
 
-		// 少し待ってからObsidianが画像リンクを書き込むのを待つ
-		setTimeout(async () => {
-			const cursor = editor.getCursor();
-			const line = editor.getLine(cursor.line);
-
-			// 画像リンクのパターンを探す: ![[ファイル名.拡張子]]（パイプ無し＝まだ加工されていないもの）
-			const pastedPattern = /!\[\[([^\]|]+\.(png|jpg|jpeg|gif|bmp|svg|webp|avif|heic|tif|tiff))\]\]/gi;
-			const match = pastedPattern.exec(line);
-			if (!match) return;
-
-			const originalFilename = match[1];
-			// 既にパイプ付きなら何もしない
-			if (originalFilename.includes("|")) return;
-
-			// 元の画像ファイルを見つける
-			const originalFile = this.app.vault.getAbstractFileByPath(originalFilename)
-				|| this.app.metadataCache.getFirstLinkpathDest(originalFilename, "");
-
-			if (!originalFile || !(originalFile instanceof TFile)) {
-				// ファイルが見つからない場合は%だけ追加する
-				const newLine = line.replace(match[0], `![[${originalFilename}|${defaultPercent}%]]`);
-				editor.setLine(cursor.line, newLine);
-				return;
-			}
-
-			// 現在のノート名を取得
+		try {
+			// 現在のノート情報を取得
 			const activeFile = this.app.workspace.getActiveFile();
 			const noteName = activeFile ? activeFile.basename : "untitled";
 
-			// 新しいファイル名を作る: ノート名_日時.拡張子
+			// ファイル名を作る: ノート名_日時.拡張子
 			const dateStr = this.getFormattedDate();
-			const ext = originalFile.extension;
+			// 元の拡張子を取得（image/png → png）
+			const ext = imageFile.name.split(".").pop() || "png";
 			const newBaseName = `${noteName}_${dateStr}`;
 
-			// 画像ファイルがあるフォルダのパス
-			const folderPath = originalFile.parent ? originalFile.parent.path : "";
+			// 保存先フォルダを取得（Obsidianの添付ファイル設定を使う）
+			// @ts-ignore - getAvailablePathForAttachments は内部APIだが安定して使える
+			const savePath = await this.app.vault.getAvailablePathForAttachments(newBaseName, ext, activeFile);
 
-			// 同名ファイルがないか確認し、あれば数字サフィックスを付ける
-			const newPath = await this.getUniqueFilePath(folderPath, newBaseName, ext);
-			const newFileName = newPath.split("/").pop() || `${newBaseName}.${ext}`;
+			// 画像データを読み込む
+			const arrayBuffer = await imageFile.arrayBuffer();
 
-			// ファイルをリネームする
-			try {
-				await this.app.fileManager.renameFile(originalFile, newPath);
+			// Vaultにファイルを保存する
+			const savedFile = await this.app.vault.createBinary(savePath, arrayBuffer);
 
-				// エディタのリンクを新しいファイル名＋%に更新する
-				// renameFile がリンクを自動更新するので、再度行を読み直す
-				const updatedLine = editor.getLine(cursor.line);
-				const nameWithoutExt = newFileName.replace(`.${ext}`, "");
-				// リネーム後のリンクにパーセントを追加する
-				const renamePattern = new RegExp(
-					`!\\[\\[${nameWithoutExt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.${ext}\\]\\]`,
-					"g"
-				);
-				if (renamePattern.test(updatedLine)) {
-					const finalLine = updatedLine.replace(renamePattern, `![[${newFileName}|${defaultPercent}%]]`);
-					editor.setLine(cursor.line, finalLine);
-				}
-			} catch (e) {
-				// リネーム失敗時は元のファイル名に%だけ追加する
-				const currentLine = editor.getLine(cursor.line);
-				const fallbackPattern = new RegExp(
-					`!\\[\\[${originalFilename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]\\]`,
-					"g"
-				);
-				const newLine = currentLine.replace(fallbackPattern, `![[${originalFilename}|${defaultPercent}%]]`);
-				editor.setLine(cursor.line, newLine);
-			}
-		}, 800);
+			// ファイル名だけ取り出す（フォルダパスは不要）
+			const savedFileName = savedFile.name;
+
+			// エディタにリンクを挿入する
+			const linkText = `![[${savedFileName}|${defaultPercent}%]]`;
+			editor.replaceSelection(linkText);
+
+		} catch (e) {
+			new Notice("画像の保存に失敗しました");
+		}
 	}
 
 	// コピー時に、カーソル行が画像リンクなら
