@@ -397,14 +397,34 @@ export default class AdvancedImagePlugin extends Plugin {
 		// (2) Overwrite the clipboard with image data 1.5 seconds later
 		setTimeout(async () => {
 			try {
-				// Read the image file's binary data
+				const ext = imageFile.extension.toLowerCase();
+
+				// For GIF: copy it to the clipboard as a file via osascript
+				// (because the ClipboardItem API doesn't support GIF)
+				if (ext === "gif") {
+					// Get the absolute path of the vault's root directory
+					const basePath = (this.app.vault.adapter as any).getBasePath();
+					const absolutePath = `${basePath}/${imageFile.path}`;
+					const { exec } = require("child_process");
+					exec(
+						`osascript -e 'set the clipboard to POSIX file "${absolutePath}"'`,
+						(error: any) => {
+							if (error) {
+								new Notice("GIFのコピーに失敗しました");
+							} else {
+								new Notice("GIFをコピーしました");
+							}
+						}
+					);
+					return;
+				}
+
+				// For non-GIF: copy it to the clipboard as image data
 				const imageData = await this.app.vault.readBinary(imageFile);
 
 				// Determine the image's MIME type (e.g. image/png, image/jpeg)
-				const ext = imageFile.extension.toLowerCase();
 				let mimeType = "image/png";
 				if (ext === "jpg" || ext === "jpeg") mimeType = "image/jpeg";
-				else if (ext === "gif") mimeType = "image/gif";
 				else if (ext === "webp") mimeType = "image/webp";
 				else if (ext === "bmp") mimeType = "image/bmp";
 				else if (ext === "svg") mimeType = "image/svg+xml";
