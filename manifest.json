@@ -1,9 +1,9 @@
 {
-	"id": "advanced-image",
-	"name": "Advanced Image",
+	"id": "obsidian-better-images",
+	"name": "Better Images",
 	"version": "1.0.0",
 	"minAppVersion": "0.15.0",
 	"description": "画像の大きさをパーセント（%）で指定できるプラグイン。モバイルでは自動で100%表示に対応。",
-	"author": "maaya",
+	"author": "noki",
 	"isDesktopOnly": false
 }
